@@ -1,0 +1,174 @@
+name: Weekly Build for FreeBSD (Serv00)
+
+on:
+  schedule:
+    # Runs every Monday at 02:00 UTC
+    - cron: '0 2 * * 1'
+  workflow_dispatch:
+    inputs:
+      force_build:
+        description: 'Force build even if already at latest version'
+        required: false
+        default: 'false'
+        type: boolean
+
+permissions:
+  contents: write
+
+jobs:
+  check:
+    name: Check for upstream updates
+    runs-on: ubuntu-latest
+    outputs:
+      upstream_tag: ${{ steps.upstream.outputs.tag }}
+      needs_build: ${{ steps.compare.outputs.needs_build }}
+    steps:
+      - name: Get latest upstream release tag
+        id: upstream
+        run: |
+          TAG=$(curl -sf \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/Wei-Shaw/sub2api/releases/latest \
+            | jq -r '.tag_name')
+          if [ -z "$TAG" ] || [ "$TAG" = "null" ]; then
+            echo "ERROR: Failed to fetch upstream release tag" >&2
+            exit 1
+          fi
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Upstream latest tag: $TAG"
+
+      - name: Get our latest release tag
+        id: current
+        run: |
+          TAG=$(curl -sf \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            https://api.github.com/repos/${{ github.repository }}/releases/latest \
+            | jq -r '.tag_name // ""') || TAG=""
+          echo "tag=$TAG" >> "$GITHUB_OUTPUT"
+          echo "Our latest tag: ${TAG:-<none>}"
+
+      - name: Determine if build is needed
+        id: compare
+        run: |
+          UPSTREAM="${{ steps.upstream.outputs.tag }}"
+          CURRENT="${{ steps.current.outputs.tag }}"
+          FORCE="${{ github.event.inputs.force_build }}"
+          if [ "$UPSTREAM" != "$CURRENT" ] || [ "$FORCE" = "true" ]; then
+            echo "needs_build=true" >> "$GITHUB_OUTPUT"
+            echo "Build needed: upstream=$UPSTREAM current=${CURRENT:-<none>}"
+          else
+            echo "needs_build=false" >> "$GITHUB_OUTPUT"
+            echo "Already up to date at $CURRENT, skipping build."
+          fi
+
+  build:
+    name: Build FreeBSD binary
+    needs: check
+    if: needs.check.outputs.needs_build == 'true'
+    runs-on: ubuntu-latest
+    env:
+      UPSTREAM_TAG: ${{ needs.check.outputs.upstream_tag }}
+    steps:
+      - name: Checkout Wei-Shaw/sub2api source
+        uses: actions/checkout@v4
+        with:
+          repository: Wei-Shaw/sub2api
+          ref: ${{ env.UPSTREAM_TAG }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: backend/go.mod
+          cache: true
+          cache-dependency-path: backend/go.sum
+
+      - name: Set up pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'pnpm'
+          cache-dependency-path: frontend/pnpm-lock.yaml
+
+      - name: Install frontend dependencies
+        run: pnpm --dir frontend install --frozen-lockfile
+
+      - name: Build frontend
+        # Vite is configured to output to ../backend/internal/web/dist
+        run: pnpm --dir frontend run build
+
+      - name: Build backend for FreeBSD amd64
+        run: |
+          cd backend
+          VERSION_FILE="cmd/server/VERSION"
+          if [ ! -f "$VERSION_FILE" ]; then
+            echo "ERROR: $VERSION_FILE not found" >&2
+            exit 1
+          fi
+          VERSION=$(tr -d '\r\n' < "$VERSION_FILE")
+          COMMIT=$(git rev-parse HEAD)
+          DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build \
+            -tags=embed \
+            -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.Date=${DATE} -X main.BuildType=release" \
+            -trimpath \
+            -o ../sub2api \
+            ./cmd/server
+
+      - name: Package binary into tarball
+        run: |
+          VERSION="${UPSTREAM_TAG#v}"
+          # Build list of files to include; only add extras that exist
+          FILES=(sub2api)
+          for f in LICENSE README.md; do
+            [ -f "$f" ] && FILES+=("$f")
+          done
+          tar -czf "sub2api_${VERSION}_freebsd_amd64.tar.gz" "${FILES[@]}"
+          sha256sum "sub2api_${VERSION}_freebsd_amd64.tar.gz" > "checksums.txt"
+          echo "ARCHIVE=sub2api_${VERSION}_freebsd_amd64.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Fetch upstream release notes
+        id: notes
+        run: |
+          BODY=$(curl -sf \
+            -H "Authorization: Bearer ${{ github.token }}" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/Wei-Shaw/sub2api/releases/tags/${UPSTREAM_TAG}" \
+            | jq -r '.body // ""')
+          # Escape percent signs and newlines for GITHUB_OUTPUT
+          BODY="${BODY//'%'/'%25'}"
+          BODY="${BODY//$'\n'/'%0A'}"
+          BODY="${BODY//$'\r'/'%0D'}"
+          echo "body=$BODY" >> "$GITHUB_OUTPUT"
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.UPSTREAM_TAG }}
+          name: "Sub2API ${{ env.UPSTREAM_TAG }} for FreeBSD (Serv00)"
+          body: |
+            FreeBSD amd64 binary for [Sub2API ${{ env.UPSTREAM_TAG }}](https://github.com/Wei-Shaw/sub2api/releases/tag/${{ env.UPSTREAM_TAG }}), compiled for use on Serv00 and other FreeBSD hosts.
+
+            ## Installation
+
+            ```sh
+            tar -xzf ${{ env.ARCHIVE }}
+            chmod +x sub2api
+            ./sub2api
+            ```
+
+            ---
+
+            ## Upstream Release Notes
+
+            ${{ steps.notes.outputs.body }}
+          files: |
+            ${{ env.ARCHIVE }}
+            checksums.txt
+          token: ${{ secrets.GITHUB_TOKEN }}

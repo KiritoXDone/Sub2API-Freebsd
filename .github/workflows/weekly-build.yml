@@ -2,7 +2,6 @@ name: Weekly Build for FreeBSD (Serv00)
 
 on:
   schedule:
-    # Runs every Monday at 02:00 UTC
     - cron: '0 2 * * 1'
   workflow_dispatch:
     inputs:
@@ -77,6 +76,15 @@ jobs:
           repository: Wei-Shaw/sub2api
           ref: ${{ env.UPSTREAM_TAG }}
 
+      - name: Force VERSION file to match upstream tag
+        run: |
+          VERSION="${UPSTREAM_TAG#v}"
+          echo "$VERSION" > backend/cmd/server/VERSION
+          echo "VERSION file forced to: $VERSION"
+          echo "VERSION=$VERSION" >> "$GITHUB_ENV"
+          echo "VERSION file content:"
+          cat backend/cmd/server/VERSION
+
       - name: Set up Go
         uses: actions/setup-go@v5
         with:
@@ -100,20 +108,14 @@ jobs:
         run: pnpm --dir frontend install --frozen-lockfile
 
       - name: Build frontend
-        # Vite is configured to output to ../backend/internal/web/dist
         run: pnpm --dir frontend run build
 
       - name: Build backend for FreeBSD amd64
         run: |
           cd backend
-          VERSION_FILE="cmd/server/VERSION"
-          if [ ! -f "$VERSION_FILE" ]; then
-            echo "ERROR: $VERSION_FILE not found" >&2
-            exit 1
-          fi
-          VERSION=$(tr -d '\r\n' < "$VERSION_FILE")
           COMMIT=$(git rev-parse HEAD)
           DATE=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+          echo "Building version: ${VERSION}"
           GOOS=freebsd GOARCH=amd64 CGO_ENABLED=0 go build \
             -tags=embed \
             -ldflags="-s -w -X main.Version=${VERSION} -X main.Commit=${COMMIT} -X main.Date=${DATE} -X main.BuildType=release" \
@@ -124,7 +126,6 @@ jobs:
       - name: Package binary into tarball
         run: |
           VERSION="${UPSTREAM_TAG#v}"
-          # Build list of files to include; only add extras that exist
           FILES=(sub2api)
           for f in LICENSE README.md; do
             [ -f "$f" ] && FILES+=("$f")
@@ -141,7 +142,6 @@ jobs:
             -H "Accept: application/vnd.github+json" \
             "https://api.github.com/repos/Wei-Shaw/sub2api/releases/tags/${UPSTREAM_TAG}" \
             | jq -r '.body // ""')
-          # Escape percent signs and newlines for GITHUB_OUTPUT
           BODY="${BODY//'%'/'%25'}"
           BODY="${BODY//$'\n'/'%0A'}"
           BODY="${BODY//$'\r'/'%0D'}"
